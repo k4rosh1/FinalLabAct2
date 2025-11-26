@@ -1,233 +1,149 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { generateClassificationData, trainClassifierModel, runPrediction } from './TFModelUtils';
+import Header from './components/Header';
+import Controls from './components/Controls';
+import ProductTable from './components/ProductTable';
+import Pagination from './components/Pagination';
+import LoadingSpinner from './components/LoadingSpinner';
+import { fetchProducts } from './services/productService';
+import { calculatePrediction, calculateDaysOfSupply } from './utils/predictionUtils';
 import './App.css';
 
 function App() {
-    // --- State Initialization ---
-    const [products, setProducts] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [fetchingData, setFetchingData] = useState(false);
-    const [searchTerm, setSearchTerm] = useState('');
-    const [showOnlyReorder, setShowOnlyReorder] = useState(false);
+  const [products, setProducts] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [predicting, setPredicting] = useState(false);
+  const [hasPredicted, setHasPredicted] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+  const [showOnlyReorder, setShowOnlyReorder] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [lastPage, setLastPage] = useState(1);
+  const [totalItems, setTotalItems] = useState(0);
+  const ITEMS_PER_PAGE = 20;
+
+  // Fetch products from API
+  useEffect(() => {
+    const loadProducts = async () => {
+      setLoading(true);
+      try {
+        const { products: fetchedProducts, meta } = await fetchProducts(currentPage, ITEMS_PER_PAGE);
+        
+        setLastPage(meta.lastPage);
+        setTotalItems(meta.total);
+
+        const formattedProducts = fetchedProducts.map(product => ({
+          ...product,
+          daysOfSupply: calculateDaysOfSupply(product.currentInventory, product.avgSalesPerWeek),
+          predictionScore: null,
+          needsReorder: null
+        }));
+
+        setProducts(formattedProducts);
+      } catch (error) {
+        console.error("Error loading products:", error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    loadProducts();
+  }, [currentPage]);
+
+  // Handle prediction
+  const handlePredict = async () => {
+    setPredicting(true);
     
-    // ML Model State
-    const [classifierModel, setClassifierModel] = useState(null);
+    // Simulate ML processing time
+    await new Promise(resolve => setTimeout(resolve, 1500));
 
-    // Pagination State
-    const [currentPage, setCurrentPage] = useState(1);
-    const [lastPage, setLastPage] = useState(1);
-    const [totalItems, setTotalItems] = useState(0);
-    const ITEMS_PER_PAGE = 20;
+    const predictedProducts = products.map(product => {
+      const predictionScore = calculatePrediction(product);
+      const needsReorder = predictionScore > 0.5;
 
-    // --- 1. Train ML Model 
-    useEffect(() => {
-        const initModel = async () => {
-            try {
-                const { trainingData, outputData } = generateClassificationData();
-                const trainedModel = await trainClassifierModel(trainingData, outputData);
-                setClassifierModel(trainedModel);
-                
-                trainingData.dispose();
-                outputData.dispose();
-            } catch (err) {
-                console.error("Model training failed", err);
-            }
-        };
-        initModel();
-    }, []);
+      return {
+        ...product,
+        predictionScore: predictionScore.toFixed(3),
+        needsReorder
+      };
+    });
 
-    // --- 2. Fetch Data from API
-    useEffect(() => {
-        const fetchData = async () => {
-            if (!classifierModel) return;
+    setProducts(predictedProducts);
+    setHasPredicted(true);
+    setPredicting(false);
+  };
 
-            setFetchingData(true);
-            try {
-                const response = await fetch(`http://localhost:8100/api/products?page=${currentPage}&per_page=${ITEMS_PER_PAGE}`);
-                
-                if (!response.ok) throw new Error('API Error');
+  // Filter logic
+  const filteredProducts = useMemo(() => {
+    let filtered = products;
 
-                const jsonResponse = await response.json();
-                
-                // Handle Laravel Resource response structure
-                const dbData = jsonResponse.data || jsonResponse;
-                const meta = jsonResponse.meta || {};
-
-                // Update Pagination
-                setLastPage(meta.last_page || 1);
-                setTotalItems(meta.total || dbData.length);
-
-                // Map Database Fields
-                const formattedData = dbData.map(item => ({
-                    id: item.id,
-                    productName: item.productName || item.product_name,
-                    currentInventory: item.currentInventory || item.current_inventory,
-                    avgSalesPerWeek: Math.round(parseFloat(item.avgSalesPerWeek || item.avg_sales_per_week)),
-                    daysToReplenish: Math.round(parseFloat(item.daysToReplenish || item.days_to_replenish)),
-                }));
-
-                // Run Predictions
-                const predictedProductsPromises = formattedData.map(async product => {
-                    const predictionScore = await runPrediction(classifierModel, product);
-                    const needsReorder = predictionScore > 0.5;
-
-                    return {
-                        ...product,
-                        predictionScore: predictionScore.toFixed(3),
-                        needsReorder,
-                        daysOfSupply: Math.round((product.currentInventory / (product.avgSalesPerWeek / 7)).toFixed(1))
-                    };
-                });
-                
-                const finalProducts = await Promise.all(predictedProductsPromises);
-                setProducts(finalProducts);
-
-            } catch (error) {
-                console.error("Fetch error:", error);
-            } finally {
-                setLoading(false);
-                setFetchingData(false);
-            }
-        };
-
-        fetchData();
-    }, [classifierModel, currentPage]);
-
-    // --- Filter Logic ---
-    const filteredProducts = useMemo(() => {
-        let filtered = products;
-
-        if (showOnlyReorder) {
-            filtered = filtered.filter(p => p.needsReorder);
-        }
-
-        if (searchTerm) {
-            const lowerCaseSearch = searchTerm.toLowerCase();
-            filtered = filtered.filter(p => 
-                p.productName.toLowerCase().includes(lowerCaseSearch)
-            );
-        }
-
-        return filtered.sort((a, b) => {
-            if (a.needsReorder && !b.needsReorder) return -1;
-            if (!a.needsReorder && b.needsReorder) return 1;
-            return parseFloat(b.predictionScore) - parseFloat(a.predictionScore);
-        });
-    }, [products, showOnlyReorder, searchTerm]);
-
-    const reorderCount = products.filter(p => p.needsReorder).length;
-
-    const handlePrev = () => {
-        if (currentPage > 1) setCurrentPage(prev => prev - 1);
-    };
-
-    const handleNext = () => {
-        if (currentPage < lastPage) setCurrentPage(prev => prev + 1);
-    };
-
-    if (loading) {
-        return (
-            <div className="dashboard-container">
-                <div className="loading-state">
-                    <h2>Loading...</h2>
-                </div>
-            </div>
-        );
+    if (showOnlyReorder && hasPredicted) {
+      filtered = filtered.filter(p => p.needsReorder);
     }
 
-    return (
-        <div className="dashboard-container">
-            <header className="dashboard-header">
-                <h1>ML-Powered Inventory Dashboard</h1>
-                <p>Total Products: {totalItems} | Urgent Reorders: {reorderCount}</p>
-            </header>
+    if (searchTerm) {
+      const lowerCaseSearch = searchTerm.toLowerCase();
+      filtered = filtered.filter(p => 
+        p.productName.toLowerCase().includes(lowerCaseSearch)
+      );
+    }
 
-            <div className="controls-bar">
-                <input
-                    type="text"
-                    placeholder="Search visible products..."
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                    className="search-input"
-                />
-                <label className="checkbox-label">
-                    <input
-                        type="checkbox"
-                        checked={showOnlyReorder}
-                        onChange={() => setShowOnlyReorder(!showOnlyReorder)}
-                    />
-                    Show Only Reorder Suggestions
-                </label>
-            </div>
+    if (hasPredicted) {
+      return filtered.sort((a, b) => {
+        if (a.needsReorder && !b.needsReorder) return -1;
+        if (!a.needsReorder && b.needsReorder) return 1;
+        return parseFloat(b.predictionScore) - parseFloat(a.predictionScore);
+      });
+    }
 
-            <main className="product-table-wrapper">
-                {fetchingData ? (
-                    <div className="table-loading-overlay">Loading Page Data...</div>
-                ) : (
-                    <table className="unique-table">
-                        <thead>
-                            <tr>
-                                <th>Product Name</th>
-                                <th>Inventory (QTY)</th>
-                                <th>Sales/Week</th>
-                                <th>Lead Time (Days)</th>
-                                <th>Days of Supply</th>
-                                <th className="suggestion-col">Reorder Suggestion</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {filteredProducts.length > 0 ? (
-                                filteredProducts.map(product => (
-                                    <tr 
-                                        key={product.id} 
-                                        className={product.needsReorder ? 'needs-reorder' : ''}
-                                    >
-                                        <td>{product.productName}</td>
-                                        <td className="data-highlight">{product.currentInventory}</td>
-                                        <td>{product.avgSalesPerWeek}</td>
-                                        <td>{product.daysToReplenish}</td>
-                                        <td className="data-highlight">{product.daysOfSupply}</td>
-                                        <td className="suggestion-col">
-                                            {product.needsReorder 
-                                                ? 'URGENT - Reorder Required' : 'OK - Sufficient Stock'}
-                                        </td>
-                                    </tr>
-                                ))
-                            ) : (
-                                <tr>
-                                    <td colSpan="6" className="no-results">
-                                        No products found on this page.
-                                    </td>
-                                </tr>
-                            )}
-                        </tbody>
-                    </table>
-                )}
+    return filtered;
+  }, [products, showOnlyReorder, searchTerm, hasPredicted]);
 
-                <div className="pagination-controls">
-                    <button 
-                        className="page-btn" 
-                        onClick={handlePrev} 
-                        disabled={currentPage === 1 || fetchingData}
-                    >
-                        &laquo; Previous
-                    </button>
-                    
-                    <span className="page-info">
-                        Page <strong>{currentPage}</strong> of <strong>{lastPage}</strong>
-                    </span>
-                    
-                    <button 
-                        className="page-btn" 
-                        onClick={handleNext} 
-                        disabled={currentPage === lastPage || fetchingData}
-                    >
-                        Next &raquo;
-                    </button>
-                </div>
-            </main>
-        </div>
-    );
+  const reorderCount = products.filter(p => p.needsReorder).length;
+
+  const handlePrevious = () => {
+    setCurrentPage(prev => Math.max(1, prev - 1));
+  };
+
+  const handleNext = () => {
+    setCurrentPage(prev => Math.min(lastPage, prev + 1));
+  };
+
+  if (loading) {
+    return <LoadingSpinner />;
+  }
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 py-8 px-4">
+      <div className="max-w-7xl mx-auto">
+        <Header
+          totalItems={totalItems}
+          reorderCount={reorderCount}
+          hasPredicted={hasPredicted}
+          predicting={predicting}
+          onPredict={handlePredict}
+        />
+
+        <Controls
+          searchTerm={searchTerm}
+          onSearchChange={setSearchTerm}
+          showOnlyReorder={showOnlyReorder}
+          onFilterChange={setShowOnlyReorder}
+          hasPredicted={hasPredicted}
+        />
+
+        <ProductTable
+          products={filteredProducts}
+          hasPredicted={hasPredicted}
+        />
+
+        <Pagination
+          currentPage={currentPage}
+          lastPage={lastPage}
+          onPrevious={handlePrevious}
+          onNext={handleNext}
+        />
+      </div>
+    </div>
+  );
 }
 
 export default App;
